@@ -1,0 +1,749 @@
+import json
+import boto3
+import datetime
+import urllib3
+import time
+import re
+import os
+import sys
+import urllib.parse
+from contextlib import nullcontext
+import json
+import boto3
+from bedrock_agentcore import BedrockAgentCoreApp
+import uuid
+
+dynamodb = boto3.resource("dynamodb")
+LOG_TABLE = os.environ.get("LOG_TABLE", "planner-agent-logs")
+
+client = boto3.client(
+    "bedrock-agentcore",
+    region_name="us-east-1"
+)
+PERF_RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:412628362818:runtime/prefagent-791YmCAqa1"
+
+EXECUTION_RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:412628362818:runtime/executionagent-IJ0prTD7tu"
+
+RCA_RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:412628362818:runtime/rcaagent-YA0mnT61kG"
+
+REGRESSION_RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:412628362818:runtime/regressionagnrt-l1EW1T6Elz"
+
+SCRIPT_RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:412628362818:runtime/scriptagent-ftijHbEjSw"
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from agents_common.otel_setup import init_otel
+
+_tracer = init_otel(os.environ.get("OTEL_SERVICE_NAME", "planner-agent"))
+app = BedrockAgentCoreApp()
+
+# ========================================================== # planner-agent # Main Decision / Orchestration Lambda # # FLOW: # GitHub Push # -> github-trigger-worker # -> planner-agent # -> AgentCore Gateway (/mcp) # -> execution / perf / script workers # -> PASS / FAIL summary # -> S3 report # ==========================================================
+# AWS Clients
+s3 = boto3.client("s3")
+http = urllib3.PoolManager()
+bedrock = boto3.client("bedrock-runtime")
+
+# Config
+BUCKET_NAME = os.environ.get("BUCKET_NAME", "mcp-agent-logs-bucket")
+
+
+GATEWAY_URL = os.environ.get(
+    "GATEWAY_URL",
+    "https://mcp-lw5usxcscz.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp",
+)
+
+# REGRESSION_TOOL_NAME = os.environ.get(
+#     "REGRESSION_TOOL_NAME", "regression-agent-target"
+# )
+# RCA_TOOL_NAME = os.environ.get("RCA_TOOL_NAME", "rca-agent-target")
+
+
+def log_to_dynamodb(log_type, data):
+
+    try:
+        table = dynamodb.Table(LOG_TABLE)
+
+        table.put_item(
+            Item={
+                "id": str(uuid.uuid4()),
+                "timestamp": str(datetime.datetime.utcnow()),
+                "type": log_type,
+                "data": json.dumps(data, default=str)
+            }
+        )
+
+    except Exception as e:
+        print("DynamoDB Log Error:", str(e))
+
+
+
+def extract_json(text):
+    import re
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        return json.loads(match.group(0))
+    return {}
+
+
+# ==========================================================
+# LLM DECISION AGENT
+# ==========================================================
+def decide_with_llm(files):
+
+    prompt = f"""
+You are an AI DevOps agent.
+
+Changed files:
+{files}
+
+Decide:
+- Should we run k6 load test?
+- Should we run SpeedCurve?
+- Should we fetch Datadog metrics?
+
+Return ONLY JSON:
+{{
+  "run_k6": true/false,
+  "run_speedcurve": true/false,
+  "run_datadog": true/false
+}}
+"""
+
+    response = bedrock.invoke_model(
+        modelId="amazon.nova-micro-v1:0",
+        body=json.dumps({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"text": prompt}
+                    ]
+                }
+            ],
+            "inferenceConfig": {
+                "maxTokens": 200,
+                "temperature": 0.3
+            }
+        })
+    )
+
+    result = json.loads(response["body"].read())
+
+    text = result["output"]["message"]["content"][0]["text"]
+
+    return extract_json(text)
+# ==========================================================
+# RCA AGENT
+# ==========================================================
+def run_rca(files, results):
+
+    prompt = f"""
+You are an AI RCA agent.
+
+Files changed:
+{files}
+
+Results:
+{json.dumps(results)}
+
+Explain:
+- What failed?
+- Root cause?
+- Fix?
+
+Short answer.
+"""
+
+    response = bedrock.invoke_model(
+        modelId="amazon.nova-micro-v1:0",
+        body=json.dumps({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"text": prompt}
+                    ]
+                }
+            ],
+            "inferenceConfig": {
+                "maxTokens": 300,
+                "temperature": 0.3
+            }
+        })
+    )
+
+    result = json.loads(response["body"].read())
+
+    return result["output"]["message"]["content"][0]["text"]
+# ==========================================================
+# Function: invoke_tool()
+# ==========================================================
+def get_token():
+    token_url = f"https://login.microsoftonline.com/{os.environ['TENANT_ID']}/oauth2/v2.0/token"
+
+    payload = {
+        "client_id": os.environ["CLIENT_ID"],
+        "client_secret": os.environ["CLIENT_SECRET"],
+        "grant_type": "client_credentials",
+        "scope": os.environ.get(
+            "ENTRA_SCOPE",
+            "api://ec2a78b3-1b43-4f83-b696-b458da75b904/.default",
+        ),
+    }
+
+    response = http.request(
+        "POST",
+        token_url,
+        body=urllib.parse.urlencode(payload),
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+    )
+
+    if response.status != 200:
+        raise Exception(
+            f"Token generation failed: {response.status}"
+        )
+
+    data = json.loads(response.data.decode("utf-8"))
+
+    return data["access_token"]
+# def get_token():
+#     try:
+#         token_url = f"https://login.microsoftonline.com/{os.environ['TENANT_ID']}/oauth2/v2.0/token"
+
+#         payload = {
+#             "client_id": os.environ["CLIENT_ID"],
+#             "client_secret": os.environ["CLIENT_SECRET"],
+#             "grant_type": "client_credentials",
+#             "scope": os.environ.get(
+#                 "ENTRA_SCOPE",
+#                 "api://ec2a78b3-1b43-4f83-b696-b458da75b904/.default",
+#             ),
+#         }
+
+#         headers = {
+#             "Content-Type": "application/x-www-form-urlencoded"
+#         }
+
+#         encoded = urllib.parse.urlencode(payload)
+
+#         #print("🚀 REQUEST URL:", token_url)
+#         #print("📦 PAYLOAD:", payload)
+
+#         response = http.request(
+#             "POST",
+#             token_url,
+#             body=encoded,
+#             headers=headers
+#         )
+
+#         raw_response = response.data.decode("utf-8")
+
+#         print("🔍 TOKEN STATUS:", response.status)
+#         #print("🔍 TOKEN RESPONSE:", raw_response)
+
+#         # ❗ yahan full error throw hoga
+#         if response.status != 200:
+#             raise Exception(f"❌ TOKEN FAILED | Status: {response.status} | Response: {raw_response}")
+
+#         data = json.loads(raw_response)
+
+#         # extra safety
+#         if "access_token" not in data:
+#             raise Exception(f"❌ NO ACCESS TOKEN IN RESPONSE: {data}")
+
+#         print("✅ TOKEN RECEIVED")
+
+#         return data["access_token"]
+
+#     except Exception as e:
+#         print("🔥 EXCEPTION IN get_token():", str(e))
+#         raise
+
+# =====================================================
+# ✅ Datadog Push (SAFE VERSION)
+# =====================================================
+# def push_to_datadog(metric_name, value, tool_name="unknown"):
+
+#     try:
+#         DATADOG_API_KEY = os.environ.get("DATADOG_API_KEY")
+#         DATADOG_SITE = os.environ.get("DATADOG_SITE", "us5.datadoghq.com")
+
+#         if not DATADOG_API_KEY:
+#             print("❌ DATADOG_API_KEY missing")
+#             return
+
+#         # ✅ ensure value is numeric
+#         try:
+#             value = float(value)
+#         except:
+#             print("❌ Invalid metric value:", value)
+#             return
+
+#         url = f"https://api.{DATADOG_SITE}/api/v1/series"
+
+#         timestamp = int(time.time())
+
+#         payload = {
+#             "series": [
+#                 {
+#                     "metric": metric_name,
+#                     "points": [[timestamp, value]],
+#                     "type": "gauge",
+
+#                     # ✅ FIX: ADD TAGS (MOST IMPORTANT)
+#                     "tags": [
+#                         "service:lambda",
+#                         "source:llm",
+#                         f"tool:{tool_name}"
+#                     ]
+#                 }
+#             ]
+#         }
+
+#         response = http.request(
+#             "POST",
+#             url,
+#             body=json.dumps(payload),
+#             headers={
+#                 "Content-Type": "application/json",
+#                 "DD-API-KEY": DATADOG_API_KEY
+#             }
+#         )
+
+#         print("Datadog status:", response.status)
+#         print("DATADOG PAYLOAD:", json.dumps(payload))
+
+#     except Exception as e:
+#         print("Datadog push error:", str(e))
+
+def push_to_datadog(metric_name, value, tool_name="unknown"):
+
+    DATADOG_API_KEY = os.environ.get("DATADOG_API_KEY")
+    DATADOG_SITE = os.environ.get("DATADOG_SITE", "us5.datadoghq.com")
+
+    if not DATADOG_API_KEY:
+        print("❌ DATADOG_API_KEY missing")
+        return False
+
+    try:
+        value = float(value)
+    except Exception:
+        print("❌ Invalid metric value:", value)
+        return False
+
+    url = f"https://api.{DATADOG_SITE}/api/v1/series"
+    timestamp = int(time.time())
+
+    payload = {
+        "series": [
+            {
+                "metric": metric_name,
+                "points": [[timestamp, value]],
+                "type": "gauge",
+                "tags": [
+                    "service:planner-agent",
+                    "runtime:lambda",
+                    "source:mcp",
+                    f"tool:{tool_name}"
+                ]
+            }
+        ]
+    }
+
+    response = http.request(
+        "POST",
+        url,
+        body=json.dumps(payload),
+        headers={
+            "Content-Type": "application/json",
+            "DD-API-KEY": DATADOG_API_KEY
+        }
+    )
+
+    response_body = response.data.decode("utf-8")
+
+    print("Datadog status:", response.status)
+    print("Datadog response:", response_body)
+
+    if response.status not in [200, 202]:
+        print("❌ Datadog metric push failed")
+        return False
+
+    return True
+# =====================================================
+# ✅ MAIN TOOL INVOCATION
+# =====================================================
+
+# def invoke_tool(tool_name, payload):
+
+#     if _tracer:
+#         span_cm = _tracer.start_as_current_span(f"gateway.{tool_name.split('___')[0]}")
+#     else:
+#         span_cm = nullcontext()
+
+#     with span_cm:
+#         return _invoke_tool_impl(tool_name, payload)
+
+
+# def _invoke_tool_impl(tool_name, payload):
+
+#     request_body = {
+#         "jsonrpc": "2.0",
+#         "id": 1,
+#         "method": "tools/call",
+#         "params": {
+#             "name": tool_name,
+#             "arguments": payload
+#         }
+#     }
+
+#     # ✅ get token
+#     token = get_token()
+
+#     try:
+#         response = http.request(
+#             "POST",
+#             GATEWAY_URL,
+#             body=json.dumps(request_body),
+#             headers={
+#                 "Content-Type": "application/json",
+#                 "Authorization": f"Bearer {token}"
+#             }
+#         )
+
+#         raw = response.data.decode("utf-8")
+
+#         print("Gateway Response:", raw)
+
+#         # =====================================================
+#         # ✅ TOKEN TRACKING
+#         # =====================================================
+#         request_tokens = len(json.dumps(request_body).split())
+#         response_tokens = len(raw.split())
+#         total_tokens = request_tokens + response_tokens
+
+#         token_log = {
+#             "token_tracking": True,
+#             "tool": tool_name,
+#             "input_tokens_estimate": request_tokens,
+#             "output_tokens_estimate": response_tokens,
+#             "total_tokens_estimate": total_tokens,
+#             "timestamp": int(time.time())
+#         }
+
+#         print(json.dumps(token_log))
+
+#         # =====================================================
+#         # ✅ PUSH TOKEN METRICS TO DATADOG (FIXED)
+#         # =====================================================
+#         try:
+#             # 🔹 global metrics
+#             push_to_datadog("llm.input_tokens", request_tokens, tool_name)
+#             push_to_datadog("llm.output_tokens", response_tokens, tool_name)
+#             push_to_datadog("llm.total_tokens", total_tokens, tool_name)
+
+#             # 🔹 per-tool metrics (safe name)
+#             #safe_tool = tool_name.replace("___", ".").replace("-", "_")
+
+#             push_to_datadog("llm.tokens.input_estimate", request_tokens, tool_name)
+#             push_to_datadog("llm.tokens.output_estimate", response_tokens, tool_name)
+#             push_to_datadog("llm.tokens.total_estimate", total_tokens, tool_name)
+
+#             # push_to_datadog(f"llm.tokens.{safe_tool}.input", request_tokens, tool_name)
+#             # push_to_datadog(f"llm.tokens.{safe_tool}.output", response_tokens, tool_name)
+#             # push_to_datadog(f"llm.tokens.{safe_tool}.total", total_tokens, tool_name)
+
+#             print("✅ Token metrics pushed to Datadog")
+
+#         except Exception as e:
+#             print("❌ Token push failed:", str(e))
+
+#         # =====================================================
+#         # ✅ SAFE PARSE
+#         # =====================================================
+#         try:
+#             parsed = json.loads(raw)
+
+#             try:
+#                 content = parsed["result"]["content"][0]["text"]
+#                 return json.loads(content)
+
+#             except:
+#                 return parsed
+
+#         except Exception as e:
+#             print("Parse Error:", str(e))
+#             return {"raw": raw}
+
+#     except Exception as e:
+#         print("Gateway Error:", str(e))
+#         return {"error": str(e)}
+def invoke_runtime(runtime_arn, payload):
+
+    try:
+
+        session_id = str(uuid.uuid4()) + str(uuid.uuid4())
+
+        response = client.invoke_agent_runtime(
+
+            agentRuntimeArn=runtime_arn,
+
+            runtimeSessionId=session_id,
+
+            payload=json.dumps(payload),
+
+            qualifier="DEFAULT"
+        )
+
+        response_body = response["response"].read()
+
+        response_data = json.loads(response_body)
+
+        print("Runtime Response:")
+        print(response_data)
+
+        return response_data
+
+    except Exception as e:
+
+        print("Runtime Error:", str(e))
+
+        return {
+            "passed": False,
+            "error": str(e)
+        }
+
+def _repo_context(event):
+    repo = event.get("repository") or {}
+    repo_full = repo.get("full_name") or os.environ.get(
+        "DEFAULT_REPO_FULL_NAME", "unknown/unknown"
+    )
+    return {
+        "repo_full_name": repo_full,
+        "head_sha": event.get("head_sha", ""),
+        "base_sha": event.get("base_sha", ""),
+        "ref": event.get("ref", ""),
+    }
+# ==========================================================
+# Function: save_report()
+# Saves final pipeline result to S3
+# ==========================================================
+def save_report(data):
+
+    key = "planner-reports/" + datetime.datetime.utcnow().strftime(
+        "%Y-%m-%d_%H-%M-%S"
+    ) + ".json"
+
+    s3.put_object(
+        Bucket=BUCKET_NAME,
+        Key=key,
+        Body=json.dumps(data, indent=2)
+    )
+
+    print("Saved Report:", key)
+
+# ==========================================================
+# Main Lambda Handler
+# ==========================================================
+def lambda_handler(event, context):
+
+    print("Incoming Event:")
+    print(json.dumps(event))
+    log_to_dynamodb("incoming_event", event)
+
+    # ------------------------------------------------------
+    # Get changed files from webhook payload
+    # ------------------------------------------------------
+    files = event.get("files", [])
+
+    print("Changed Files:", files)
+
+    # Final results container
+    results = {}
+
+    # ------------------------------------------------------
+    # Decision Flags
+    # ------------------------------------------------------
+    decision = decide_with_llm(files)
+
+    print("LLM Decision:", decision)
+
+    run_k6 = decision.get("run_k6", False)
+    run_speedcurve = decision.get("run_speedcurve", False)
+    run_datadog = decision.get("run_datadog", True)
+
+    # ======================================================
+    # Run Real K6 through execution-worker
+    # ======================================================
+    if run_k6:
+        print("Calling execution-worker for K6")
+
+        results["k6"] = invoke_runtime(
+            EXECUTION_RUNTIME_ARN,
+            {
+                "issue": "Run real k6 load test"
+            }
+        )
+
+    # ======================================================
+    # Run SpeedCurve through perf-worker
+    # ======================================================
+    if run_speedcurve:
+        print("Calling perf-worker for SpeedCurve")
+
+        results["speedcurve"] = invoke_runtime(
+            PERF_RUNTIME_ARN,
+            {
+                "issue": "Run SpeedCurve analysis"
+            }
+        )
+
+    # ======================================================
+    # Run Datadog through perf-worker
+    # ======================================================
+    if run_datadog:
+        print("Calling perf-worker for Datadog")
+
+        results["datadog"] = invoke_runtime(
+            PERF_RUNTIME_ARN,
+            {
+                "issue": "Fetch Datadog metrics"
+            }
+        )
+
+    # ======================================================
+    # 🔥 FORCE FAIL (FIXED INDENT)
+    # ======================================================
+    if event.get("force_fail"):
+        print("⚠️ FORCE FAIL TRIGGERED")
+        passed = False
+        reasons = ["Forced failure for RCA demo"]
+    else:
+
+        # ======================================================
+        # PASS / FAIL Evaluation
+        # ======================================================
+        passed = True
+        reasons = []
+
+        for key, value in results.items():
+
+            if isinstance(value, dict) and value.get("error"):
+                passed = False
+                reasons.append(key + " tool failed")
+
+            if isinstance(value, dict) and value.get("passed") is False:
+                passed = False
+                reasons.append(key + " check failed")
+
+    final_status = "PASS" if passed else "FAIL"
+
+    # ======================================================
+    # Regression agent (Datadog baseline) then RCA if regressed
+    # ======================================================
+    ctx = _repo_context(event)
+    regression_result = {}
+    rca_agent_result = {}
+
+    if os.environ.get("ENABLE_REGRESSION_AGENT", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        regression_result = invoke_runtime(
+            REGRESSION_RUNTIME_ARN,
+            {
+                "repo_full_name": ctx["repo_full_name"],
+                "ref": ctx["ref"],
+                "head_sha": ctx["head_sha"],
+                "base_sha": ctx["base_sha"],
+            },
+        )
+        results["regression"] = regression_result
+
+        if regression_result.get("regression") and not regression_result.get("error"):
+            rca_agent_result = invoke_runtime(
+                RCA_RUNTIME_ARN,
+                {
+                    "repo_full_name": ctx["repo_full_name"],
+                    "ref": ctx["ref"],
+                    "head_sha": ctx["head_sha"],
+                    "base_sha": ctx["base_sha"],
+                    "files": files,
+                    "regression_context": regression_result,
+                },
+            )
+            results["rca_agent"] = rca_agent_result
+
+    # ======================================================
+    # Slack Alert through script-worker  test
+    # ======================================================
+    slack_msg = "Pipeline Result: " + final_status
+    if regression_result.get("baseline_seeded"):
+        slack_msg += " | performance baseline seeded"
+    if regression_result.get("regression"):
+        slack_msg += " | REGRESSION vs baseline"
+    results["slack"] = invoke_runtime(
+        SCRIPT_RUNTIME_ARN,
+        {"issue": "slack", "message": slack_msg},
+    )
+
+    # ======================================================
+    # Final Summary Object
+    # ======================================================
+    summary = {
+        "status": final_status,
+        "reasons": reasons,
+        "files": files,
+        "results": results,
+        "timestamp": str(datetime.datetime.utcnow()),
+        "regression": regression_result,
+    }
+
+    rca_output = None
+    if rca_agent_result.get("rca"):
+        rca_output = rca_agent_result.get("rca")
+    elif final_status == "FAIL":
+        rca_output = run_rca(files, results)
+    else:
+        rca_output = "No RCA generated (checks passed, no regression RCA)"
+
+    summary["rca"] = rca_output
+
+    print("RCA:", json.dumps(rca_output) if isinstance(rca_output, dict) else rca_output)
+
+    # ======================================================
+    # Save report in S3
+    # ======================================================
+    save_report(summary)
+
+    print("Final Summary:")
+    print(json.dumps(summary))
+
+    # ======================================================
+    # Return Lambda Response
+    # ======================================================
+    return {
+        "statusCode": 200,
+        "body": json.dumps(summary)
+    }
+@app.entrypoint
+def invoke(payload):
+
+    print("=== ENTRYPOINT STARTED ===", flush=True)
+
+    print(json.dumps(payload), flush=True)
+
+    result = lambda_handler(payload, None)
+
+    print("=== ENTRYPOINT FINISHED ===", flush=True)
+
+    print(json.dumps(result), flush=True)
+
+    return result
+
+
+if __name__ == "__main__":
+    app.run()
